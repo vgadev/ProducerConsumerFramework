@@ -21,17 +21,21 @@ namespace VGA.Tools.ProducerConsumer
     }
 
 
-    public interface IProcessingStage
+    public interface IWaitable
+    {
+        /// <summary>
+        /// Blocks the calling thread until the execution of the stage is completed.
+        /// </summary>
+        void WaitForCompletion();
+    }
+
+    public interface IProcessingStage : IWaitable
     {
         /// <summary>
         /// Starts the main execution loop of the stage.
         /// </summary>
         void Start();
 
-        /// <summary>
-        /// Blocks the calling thread until the execution of the stage is completed.
-        /// </summary>
-        void WaitForCompletion();
         /// <summary>
         /// The number of parallel threads that this stage will use for processing.
         /// </summary>

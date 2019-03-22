@@ -21,13 +21,17 @@ namespace VGA.Tools.ProducerConsumer
         private Queue<TOutputType> mProcessedItems = new Queue<TOutputType>();
         private object mQueueLock = new object();
         protected int mPipelineDepth = 1;
-        private bool mIsDone = false;
-        private Semaphore mCompletionIndicator = new Semaphore(0,1);
-        protected Semaphore mPipelineParallelismController = null;
-        private IProcessingOutput<TInputType> mPrevious;
+        private bool mIsProcessingDone = false;
+        private Semaphore mPipelineParallelismController = null;
+        private AutoResetEvent mProcessingCompletedSignal = new AutoResetEvent(false);
+        private AutoResetEvent mCompletionEvent = new AutoResetEvent(false);
+        private AutoResetEvent mOutputPipelineSignaller = new AutoResetEvent(true);
+        private WaitHandle[] mCompletionHandle = null;
         protected string mName = string.Empty;
         private bool mIsParallel = false;
         private bool mOutputIteratorBlocked = true;
+        private bool mShouldWaitForOutputQueue = true;
+        private int mActiveThreadCount = 0;
 
         public delegate void PipelineEventDelegate(IProcessingStage<TInputType,TOutputType> sender);
         public event PipelineEventDelegate Started;
@@ -52,14 +56,23 @@ namespace VGA.Tools.ProducerConsumer
         /// <param name="name">The name of the stage.</param>
         /// <param name="pipelineDepth">The maximum depth of the queue allowed in this stage.</param>
         /// <param name="previousStage">The previous stage from where this stage takes its input.</param>
-        public PipelineStage(string name, int pipelineDepth, IProcessingOutput<TInputType> previousStage, bool isParallel)
+        /// <param name="isParallel">Set to true to use parallel threads in this stage.</param>
+        public PipelineStage(string name, int pipelineDepth, IProcessingOutput<TInputType> previousStage, bool isParallel) :
+            this(name, pipelineDepth, previousStage.GetOutput(), isParallel, true)
         {
-            mInputIterator = previousStage.GetOutput();
-            mPipelineDepth = pipelineDepth;
-            mPrevious = previousStage;
-            mName = name;
-            mIsParallel = isParallel;
-            InitControllers();
+        }
+
+        /// <summary>
+        /// Construct a pipeline stage.
+        /// </summary>
+        /// <param name="name">The name of the stage.</param>
+        /// <param name="pipelineDepth">The maximum depth of the queue allowed in this stage.</param>
+        /// <param name="previousStage">The previous stage from where this stage takes its input.</param>
+        /// <param name="isParallel">Set to true to use parallel threads in this stage.</param>
+        /// <param name="shouldWaitForOutputQueue">Set to false to indicate completion without waiting for the output queue to drain.</param>
+        public PipelineStage(string name, int pipelineDepth, IProcessingOutput<TInputType> previousStage, bool isParallel, bool shouldWaitForOutputQueue):
+            this(name, pipelineDepth, previousStage.GetOutput(), isParallel, shouldWaitForOutputQueue)
+        {
         }
 
         /// <summary>
@@ -68,13 +81,15 @@ namespace VGA.Tools.ProducerConsumer
         /// <param name="name">The name of the stage.</param>
         /// <param name="pipelineDepth">The maximum depth of the queue allowed in this stage.</param>
         /// <param name="inputIterator">The iterator to use to take input for this stage.</param>
-        public PipelineStage(string name, int pipelineDepth, IEnumerable<TInputType> inputIterator, bool isParallel)
+        /// <param name="isParallel">Set to true to use parallel threads in this stage.</param>
+        /// <param name="shouldWaitForOutputQueue">Set to false to indicate completion without waiting for the output queue to drain.</param>
+        public PipelineStage(string name, int pipelineDepth, IEnumerable<TInputType> inputIterator, bool isParallel, bool shouldWaitForOutputQueue)
         {
             mInputIterator = inputIterator;
             mPipelineDepth = pipelineDepth;
-            mPrevious = null;
             mName = name;
             mIsParallel = isParallel;
+            mShouldWaitForOutputQueue = shouldWaitForOutputQueue;
             InitControllers();
         }
 
@@ -116,19 +131,32 @@ namespace VGA.Tools.ProducerConsumer
             {
                 ProcessItemInternal(item);
             }
-            if(mIsParallel)
+            WaitForWorkerThreads();
+            // Unblock the output pipeline if it is blocked and let it run to completion.
+            mOutputPipelineSignaller.Set();
+            if(!mShouldWaitForOutputQueue)
             {
-                // Busy wait for threads to complete.
-                int count1 = 0, count2 = 0, temp = 0;
-                do
-                {
-                    ThreadPool.GetAvailableThreads(out count1, out temp);
-                    ThreadPool.GetMaxThreads(out count2, out temp);
-                    Thread.Sleep(250);
-                } while (count1 != count2);
+                mCompletionEvent.Set();
             }
-            MarkDone();
+            // If we are not waiting for the output pipeline to drain,
+            // then this should already be signaled by the previous if block.
+            WaitForCompletion();
             RaiseCompletedEvent();
+        }
+
+        private void WaitForWorkerThreads()
+        {
+            if (mIsParallel)
+            {
+                CheckAndSignalIfZero(mActiveThreadCount);
+                WaitHandle.WaitAll(new WaitHandle[] { mProcessingCompletedSignal });
+            }
+            OnThreadsCompleted();
+        }
+
+        private void OnThreadsCompleted()
+        {
+            mIsProcessingDone = true;
         }
 
         /// <summary>
@@ -138,7 +166,8 @@ namespace VGA.Tools.ProducerConsumer
         /// <returns></returns>
         public virtual IEnumerable<TOutputType> GetOutput()
         {
-            while (!mIsDone || mProcessedItems.Count > 0)
+            WaitHandle[] outputWaiterHandle = new WaitHandle[] { mOutputPipelineSignaller };
+            while (!mIsProcessingDone || mProcessedItems.Count > 0)
             {
                 int queueLength = mProcessedItems.Count;
                 if (queueLength > 0)
@@ -148,18 +177,18 @@ namespace VGA.Tools.ProducerConsumer
                     {
                         item = mProcessedItems.Dequeue();
                     }
-                    if (!mIsDone && queueLength == 1)
+                    if (!mIsProcessingDone && queueLength == 1)
                     {
                         mOutputIteratorBlocked = true;
+                        mOutputPipelineSignaller.Reset();
+                        WaitHandle.WaitAll(outputWaiterHandle);
                     }
                     yield return item;
                 }
-                if (mOutputIteratorBlocked)
-                {
-                    // Rest a bit before checking for queued items.
-                    Thread.Sleep(250);
-                    mOutputIteratorBlocked = false;
-                }
+            }
+            if (mShouldWaitForOutputQueue)
+            {
+                mCompletionEvent.Set();
             }
             yield break;
         }
@@ -169,11 +198,12 @@ namespace VGA.Tools.ProducerConsumer
         /// </summary>
         public void WaitForCompletion()
         {
-            mCompletionIndicator.WaitOne();
+            WaitHandle.WaitAll(mCompletionHandle);
         }
 
         private void InitControllers()
         {
+            mCompletionHandle = new WaitHandle[] { mCompletionEvent };
             if (mIsParallel)
             {
                 mPipelineParallelismController = new Semaphore(mPipelineDepth, mPipelineDepth);
@@ -203,6 +233,7 @@ namespace VGA.Tools.ProducerConsumer
                 // Use the semaphore to maintain depth of the pipeline, when multi-threaded.
                 // This will be released by ProcessItemWrapper.
                 mPipelineParallelismController.WaitOne();
+                Interlocked.Increment(ref mActiveThreadCount);
                 ThreadPool.QueueUserWorkItem(new WaitCallback(ProcessItemWrapper), inputItem);
             }
             else
@@ -220,6 +251,8 @@ namespace VGA.Tools.ProducerConsumer
             if (mIsParallel)
             {
                 mPipelineParallelismController.Release();
+                Interlocked.Decrement(ref mActiveThreadCount);
+                CheckAndSignalIfZero(mActiveThreadCount);
             }
             if (RaiseValidateProcessedItem(result))
             {
@@ -227,6 +260,14 @@ namespace VGA.Tools.ProducerConsumer
                 {
                     AddItemToOutputQueue(result);
                 }
+            }
+        }
+
+        private void CheckAndSignalIfZero(int threadCount)
+        {
+            if(threadCount == 0)
+            {
+                mProcessingCompletedSignal.Set();
             }
         }
 
@@ -255,21 +296,13 @@ namespace VGA.Tools.ProducerConsumer
             }
         }
 
-        protected void MarkDone()
-        {
-            if (!mIsDone)
-            {
-                mCompletionIndicator.Release();
-                mIsDone = true;
-            }
-        }
-
         protected void AddItemToOutputQueue(TOutputType item)
         {
             lock (mQueueLock)
             {
                 mProcessedItems.Enqueue(item);
             }
+            mOutputPipelineSignaller.Set();
             if (mOutputIteratorBlocked)
             {
                 mOutputIteratorBlocked = false;
