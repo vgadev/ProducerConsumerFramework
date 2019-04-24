@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "TaskParallelizer": {
+      "commandName": "Project",
+      "commandLineArgs": "-c \"dir c:\\Windows\" -c \"dir C:\\Users\" -c \"dir c:\\Temp\""
+    }
+  }
+}
