@@ -1,5 +1,5 @@
 # ProducerConsumerFramework
-A basic producer consumer framework for .NET Core
+A basic producer consumer framework using C#. This can be used with both .NET framework and .NET Core.
 
 The code in this project provides a basic framework to quickly set up a pipeline of producer consumer blocks.
 The main inspiration behind the code was the need to build a stability testing tool that can track crashes and other situations when testing an application
